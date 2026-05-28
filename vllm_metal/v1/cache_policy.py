@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -15,6 +16,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCache
 from vllm_metal.config import (
     PAGED_ATTENTION_DEFAULT_MEMORY_FRACTION,
     PAGED_ATTENTION_MIN_BLOCKS,
+    MetalConfig,
     get_config,
 )
 from vllm_metal.metal_kernel_backend.turboquant import (
@@ -42,20 +44,6 @@ if TYPE_CHECKING:
     from vllm_metal.v1.worker import MetalWorker
 
 logger = init_logger(__name__)
-
-
-def _turboquant_page_size_bytes(
-    block_size: int, num_kv_heads: int, head_dim: int, k_quant: str, v_quant: str
-) -> int:
-    """Calculate TurboQuant-compressed page size for one layer."""
-    k_bits = QUANT_PARAMS[k_quant]["bits"]
-    v_bits = V_QUANT_PARAMS[v_quant]["bits"]
-    k_packed = packed_dim(head_dim, k_bits)
-    v_packed = packed_dim(head_dim, v_bits)
-    kv_bytes = block_size * num_kv_heads * (k_packed + v_packed)
-    scale_groups = head_dim // TQ_BLOCK_SIZE
-    scale_bytes = 3 * block_size * num_kv_heads * scale_groups * 2
-    return kv_bytes + scale_bytes
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -86,37 +74,60 @@ class TurboQuantAttentionSpec(FullAttentionSpec):
         )
 
     @classmethod
-    def merge(cls, specs):
-        assert all(isinstance(s, TurboQuantAttentionSpec) for s in specs), (
-            "All attention layers in the same KV cache group must be "
-            "TurboQuantAttentionSpec."
-        )
-        k_set = {s.k_quant for s in specs}
-        v_set = {s.v_quant for s in specs}
-        assert len(k_set) == 1 and len(v_set) == 1, (
-            "All TurboQuant layers in the same cache group must share the "
-            "same (k_quant, v_quant); mixed-quant groups are not supported."
-        )
+    def merge(cls, specs: Sequence[FullAttentionSpec]) -> TurboQuantAttentionSpec:
+        turbo_specs: list[TurboQuantAttentionSpec] = []
+        for spec in specs:
+            if not isinstance(spec, TurboQuantAttentionSpec):
+                raise TypeError(
+                    "All attention layers in the same KV cache group must be "
+                    "TurboQuantAttentionSpec."
+                )
+            turbo_specs.append(spec)
+        if not turbo_specs:
+            raise ValueError("TurboQuantAttentionSpec.merge() requires specs")
+
+        k_set = {s.k_quant for s in turbo_specs}
+        v_set = {s.v_quant for s in turbo_specs}
+        if len(k_set) != 1 or len(v_set) != 1:
+            raise ValueError(
+                "All TurboQuant layers in the same cache group must share the "
+                "same (k_quant, v_quant); mixed-quant groups are not supported."
+            )
+        first = turbo_specs[0]
         return cls(
-            block_size=specs[0].block_size,
-            num_kv_heads=specs[0].num_kv_heads,
-            head_size=specs[0].head_size,
-            head_size_v=specs[0].head_size_v,
-            dtype=specs[0].dtype,
-            page_size_padded=specs[0].page_size_padded,
+            block_size=first.block_size,
+            num_kv_heads=first.num_kv_heads,
+            head_size=first.head_size,
+            head_size_v=first.head_size_v,
+            dtype=first.dtype,
+            page_size_padded=first.page_size_padded,
             sliding_window=cls.merge_window_sizes(
-                {s.sliding_window for s in specs if s.sliding_window is not None}
+                {s.sliding_window for s in turbo_specs if s.sliding_window is not None}
             ),
             attention_chunk_size=cls.merge_window_sizes(
                 {
                     s.attention_chunk_size
-                    for s in specs
+                    for s in turbo_specs
                     if s.attention_chunk_size is not None
                 }
             ),
             k_quant=k_set.pop(),
             v_quant=v_set.pop(),
         )
+
+
+def _turboquant_page_size_bytes(
+    block_size: int, num_kv_heads: int, head_dim: int, k_quant: str, v_quant: str
+) -> int:
+    """Calculate TurboQuant-compressed page size for one layer."""
+    k_bits = QUANT_PARAMS[k_quant]["bits"]
+    v_bits = V_QUANT_PARAMS[v_quant]["bits"]
+    k_packed = packed_dim(head_dim, k_bits)
+    v_packed = packed_dim(head_dim, v_bits)
+    kv_bytes = block_size * num_kv_heads * (k_packed + v_packed)
+    scale_groups = head_dim // TQ_BLOCK_SIZE
+    scale_bytes = 3 * block_size * num_kv_heads * scale_groups * 2
+    return kv_bytes + scale_bytes
 
 
 def _build_turboquant_attention_spec(
@@ -191,11 +202,52 @@ class _PagedAttentionPlan:
     metal_limit: int
     usable_metal: int
     model_memory: int
+    overhead: int
     per_block_bytes: int
-    kv_budget_before_hybrid: int
+    base_kv_budget: int
     hybrid_gdn_reservation: _HybridGDNReservation
     kv_budget: int
     num_blocks: int
+
+    def format_breakdown(self) -> str:
+        parts = [
+            f"metal_limit={self.metal_limit / 1e9:.2f}GB",
+            f"fraction={self.fraction}",
+            f"usable_metal={self.usable_metal / 1e9:.2f}GB",
+            f"model_memory={self.model_memory / 1e9:.2f}GB",
+            f"overhead={self.overhead / 1e9:.2f}GB",
+        ]
+        if self.hybrid_gdn_reservation.enabled:
+            parts.append(f"kv_budget_before_hybrid={self.base_kv_budget / 1e9:.2f}GB")
+            parts.append(self._hybrid_gdn_detail())
+        parts.append(f"kv_budget={self.kv_budget / 1e9:.2f}GB")
+        return ", ".join(parts)
+
+    def format_mitigations(self) -> str:
+        mitigations = [
+            "increase VLLM_METAL_MEMORY_FRACTION",
+            "use a smaller or more quantized model",
+        ]
+        reservation = self.hybrid_gdn_reservation
+        if reservation.enabled and reservation.max_num_seqs > 1:
+            seq_mitigation = (
+                "lower --max-num-seqs (for single-user serving, try --max-num-seqs 1)"
+            )
+            if self.base_kv_budget > 0:
+                mitigations.insert(0, seq_mitigation)
+            else:
+                mitigations.append(seq_mitigation)
+        return "Mitigations: " + "; ".join(mitigations) + "."
+
+    def _hybrid_gdn_detail(self) -> str:
+        reservation = self.hybrid_gdn_reservation
+        if not reservation.enabled:
+            return ""
+        return (
+            f"hybrid_gdn_state={reservation.total_bytes / 1e9:.2f}GB "
+            f"({reservation.bytes_per_slot / 1e6:.1f}MB/seq * "
+            f"max_num_seqs={reservation.max_num_seqs})"
+        )
 
 
 class ModelCachePolicy:
@@ -236,13 +288,9 @@ class ModelCachePolicy:
         block_size = self._runner.cache_config.block_size
         torch_dtype = MLX_TO_TORCH_DTYPE[self._require_kv_cache_dtype()]
         config = get_config()
-        use_turboquant = (
-            config.turboquant and not self._runner.is_hybrid and not self._runner.is_mla
-        )
+        use_turboquant = self._use_turboquant(config)
 
-        kv_heads_list = self._runner.kv_heads_per_layer
-        head_dim_list = self._runner.head_dim_per_layer
-        has_per_layer = kv_heads_list is not None and head_dim_list is not None
+        kv_heads, head_dims = self._cache_layer_shapes(self._runner.num_layers)
         specs: dict[str, KVCacheSpec] = {}
         for layer_idx in range(self._runner.num_layers):
             if (
@@ -270,19 +318,11 @@ class ModelCachePolicy:
                     v_quant=config.v_quant,
                 )
             else:
-                kv_h = (
-                    kv_heads_list[layer_idx]
-                    if has_per_layer
-                    else self._runner.num_kv_heads
-                )
-                hd = (
-                    head_dim_list[layer_idx] if has_per_layer else self._runner.head_dim
-                )
                 layer_name = f"layers.{layer_idx}.self_attn"
                 specs[layer_name] = FullAttentionSpec(
                     block_size=block_size,
-                    num_kv_heads=kv_h,
-                    head_size=hd,
+                    num_kv_heads=kv_heads[layer_idx],
+                    head_size=head_dims[layer_idx],
                     dtype=torch_dtype,
                 )
 
@@ -304,15 +344,11 @@ class ModelCachePolicy:
         self._require_supported_per_layer_shapes()
         block_size = self._runner.cache_config.block_size
         dtype_size = self._require_kv_cache_dtype().size
-        num_kv_layers = (
-            self._runner.num_sdpa_layers
-            if self._runner.is_hybrid
-            else self._runner.num_kv_cache_layers
-        )
+        num_kv_layers = self._num_kv_cache_layers()
 
         # TurboQuant uses quantized KV cache with different byte layout
         config = get_config()
-        if config.turboquant and not self._runner.is_hybrid and not self._runner.is_mla:
+        if self._use_turboquant(config):
             return num_kv_layers * _turboquant_page_size_bytes(
                 block_size=block_size,
                 num_kv_heads=self._runner.num_kv_heads,
@@ -321,8 +357,7 @@ class ModelCachePolicy:
                 v_quant=config.v_quant,
             )
 
-        kv_factor = 1 if self._runner.is_mla else 2
-        return kv_factor * block_size * dtype_size * self._kv_layer_size_sum()
+        return self._kv_factor() * block_size * dtype_size * self._kv_layer_size_sum()
 
     def linear_cache_bytes_per_slot(self) -> int:
         """Return bytes for one request's linear-attention state."""
@@ -354,7 +389,7 @@ class ModelCachePolicy:
             return self._build_mla_backend(block_size)
         return self._build_mha_backend(block_size)
 
-    def _install_gemma4_mtp_kv_sharing(
+    def install_gemma4_mtp_kv_sharing(
         self,
         backend: PagedAttentionBackend,
         *,
@@ -386,15 +421,11 @@ class ModelCachePolicy:
         self._require_supported_per_layer_shapes()
         dtype_size = self._require_kv_cache_dtype().size
         aligned_tokens = -(-max_model_len // block_size) * block_size
-        num_kv_layers = (
-            self._runner.num_sdpa_layers
-            if self._runner.is_hybrid
-            else self._runner.num_kv_cache_layers
-        )
+        num_kv_layers = self._num_kv_cache_layers()
 
         # TurboQuant uses quantized KV cache with different byte layout
         config = get_config()
-        if config.turboquant and not self._runner.is_hybrid and not self._runner.is_mla:
+        if self._use_turboquant(config):
             # _turboquant_page_size_bytes is parameterised by tokens (block_size);
             # pass aligned_tokens to get the per-sequence byte total directly.
             return num_kv_layers * _turboquant_page_size_bytes(
@@ -405,9 +436,8 @@ class ModelCachePolicy:
                 v_quant=config.v_quant,
             )
 
-        kv_factor = 1 if self._runner.is_mla else 2
         sdpa_kv_bytes = (
-            kv_factor * aligned_tokens * dtype_size * self._kv_layer_size_sum()
+            self._kv_factor() * aligned_tokens * dtype_size * self._kv_layer_size_sum()
         )
         if self._runner.is_hybrid:
             return sdpa_kv_bytes + self.linear_cache_bytes_per_slot()
@@ -415,24 +445,6 @@ class ModelCachePolicy:
 
     def _build_hybrid_backend(self, block_size: int) -> HybridPagedAttentionBackend:
         config = get_config()
-        if config.turboquant:
-            return HybridPagedAttentionBackend(
-                num_layers=self._runner.num_layers,
-                full_attention_interval=self._runner.full_attention_interval,
-                max_num_seqs=self._runner.scheduler_config.max_num_seqs,
-                num_kv_heads=self._runner.num_kv_heads,
-                head_dim=self._runner.head_dim,
-                linear_num_v_heads=self._runner.linear_num_v_heads,
-                linear_key_head_dim=self._runner.linear_key_head_dim,
-                linear_value_head_dim=self._runner.linear_value_head_dim,
-                linear_conv_kernel_dim=self._runner.linear_conv_kernel_dim,
-                linear_conv_dim=self._runner.linear_conv_dim,
-                block_size=block_size,
-                dtype=self._require_kv_cache_dtype(),
-                turboquant=True,
-                k_quant=config.k_quant,
-                v_quant=config.v_quant,
-            )
         return HybridPagedAttentionBackend(
             num_layers=self._runner.num_layers,
             full_attention_interval=self._runner.full_attention_interval,
@@ -446,9 +458,9 @@ class ModelCachePolicy:
             linear_conv_dim=self._runner.linear_conv_dim,
             block_size=block_size,
             dtype=self._require_kv_cache_dtype(),
-            turboquant=False,
-            k_quant=None,
-            v_quant=None,
+            turboquant=config.turboquant,
+            k_quant=config.k_quant if config.turboquant else None,
+            v_quant=config.v_quant if config.turboquant else None,
         )
 
     def _build_mla_backend(self, block_size: int) -> MLAPagedAttentionBackend:
@@ -535,16 +547,25 @@ class ModelCachePolicy:
 
         For uniform models this equals ``num_kv_layers × kv_heads × head_dim``.
         """
-        num_kv_layers = (
-            self._runner.num_sdpa_layers
-            if self._runner.is_hybrid
-            else self._runner.num_kv_cache_layers
-        )
+        num_kv_layers = self._num_kv_cache_layers()
         kv_heads = self._runner.kv_heads_per_layer
         head_dims = self._runner.head_dim_per_layer
         if kv_heads is not None and head_dims is not None:
             return sum(kv_heads[i] * head_dims[i] for i in range(num_kv_layers))
         return num_kv_layers * self._runner.num_kv_heads * self._runner.head_dim
+
+    def _num_kv_cache_layers(self) -> int:
+        if self._runner.is_hybrid:
+            return self._runner.num_sdpa_layers
+        return self._runner.num_kv_cache_layers
+
+    def _use_turboquant(self, config: MetalConfig) -> bool:
+        return bool(
+            config.turboquant and not self._runner.is_hybrid and not self._runner.is_mla
+        )
+
+    def _kv_factor(self) -> int:
+        return 1 if self._runner.is_mla else 2
 
     def _mha_cache_layout(self) -> tuple[int, list[int] | None]:
         if self._runner._yoco_cache_mapping is None:
@@ -570,85 +591,6 @@ class WorkerCachePlanner:
     def __init__(self, worker: MetalWorker) -> None:
         self._worker = worker
 
-    @staticmethod
-    def kv_budget_bytes(
-        metal_limit: int,
-        model_memory: int,
-        fraction: float,
-        overhead: int,
-    ) -> int:
-        """Return Metal-memory budget available for paged KV cache."""
-        return int(metal_limit * fraction) - model_memory - overhead
-
-    def _hybrid_gdn_reservation(self) -> _HybridGDNReservation:
-        """Return startup GDN state reserved outside the paged KV pool."""
-        runner = self._worker.model_runner
-        if not runner.is_hybrid:
-            return _HybridGDNReservation()
-        return _HybridGDNReservation(
-            bytes_per_slot=runner.linear_cache_bytes_per_slot(),
-            max_num_seqs=runner.scheduler_config.max_num_seqs,
-        )
-
-    @staticmethod
-    def _hybrid_gdn_detail(reservation: _HybridGDNReservation) -> str:
-        if not reservation.enabled:
-            return ""
-        return (
-            f"hybrid_gdn_state={reservation.total_bytes / 1e9:.2f}GB "
-            f"({reservation.bytes_per_slot / 1e6:.1f}MB/seq * "
-            f"max_num_seqs={reservation.max_num_seqs}), "
-        )
-
-    @staticmethod
-    def _paged_attention_mitigations(
-        reservation: _HybridGDNReservation,
-        *,
-        kv_budget_before_hybrid: int,
-    ) -> str:
-        mitigations = [
-            "increase VLLM_METAL_MEMORY_FRACTION",
-            "use a smaller or more quantized model",
-        ]
-        if reservation.enabled and reservation.max_num_seqs > 1:
-            seq_mitigation = (
-                "lower --max-num-seqs (for single-user serving, try --max-num-seqs 1)"
-            )
-            if kv_budget_before_hybrid > 0:
-                mitigations.insert(0, seq_mitigation)
-            else:
-                mitigations.append(seq_mitigation)
-        return "Mitigations: " + "; ".join(mitigations) + "."
-
-    @classmethod
-    def _memory_breakdown(
-        cls,
-        *,
-        metal_limit: int,
-        fraction: float,
-        usable_metal: int,
-        model_memory: int,
-        overhead: int,
-        kv_budget_before_hybrid: int,
-        reservation: _HybridGDNReservation,
-        kv_budget: int,
-    ) -> str:
-        before_hybrid = (
-            f"kv_budget_before_hybrid={kv_budget_before_hybrid / 1e9:.2f}GB, "
-            if reservation.enabled
-            else ""
-        )
-        return (
-            f"metal_limit={metal_limit / 1e9:.2f}GB, "
-            f"fraction={fraction}, "
-            f"usable_metal={usable_metal / 1e9:.2f}GB, "
-            f"model_memory={model_memory / 1e9:.2f}GB, "
-            f"overhead={overhead / 1e9:.2f}GB, "
-            f"{before_hybrid}"
-            f"{cls._hybrid_gdn_detail(reservation)}"
-            f"kv_budget={kv_budget / 1e9:.2f}GB"
-        )
-
     def setup_paged_attention(self, *, overhead: int) -> None:
         """Allocate paged KV cache and patch the loaded model."""
         self._worker.model_runner.validate_paged_attention_support()
@@ -657,16 +599,7 @@ class WorkerCachePlanner:
             "Paged attention memory breakdown: "
             "%s, per_block_bytes=%d, "
             "num_blocks=%d, max_tokens_cached=%d",
-            self._memory_breakdown(
-                metal_limit=plan.metal_limit,
-                fraction=plan.fraction,
-                usable_metal=plan.usable_metal,
-                model_memory=plan.model_memory,
-                overhead=overhead,
-                kv_budget_before_hybrid=plan.kv_budget_before_hybrid,
-                reservation=plan.hybrid_gdn_reservation,
-                kv_budget=plan.kv_budget,
-            ),
+            plan.format_breakdown(),
             plan.per_block_bytes,
             plan.num_blocks,
             plan.num_blocks * plan.block_size,
@@ -676,7 +609,7 @@ class WorkerCachePlanner:
             block_size=plan.block_size
         )
         backend.initialize(plan.num_blocks)
-        self._worker.model_runner._cache_policy._install_gemma4_mtp_kv_sharing(
+        self._worker.model_runner.install_gemma4_mtp_kv_sharing(
             backend,
             block_size=plan.block_size,
         )
@@ -703,8 +636,10 @@ class WorkerCachePlanner:
             config.k_quant if config.turboquant else "N/A",
         )
 
-        self._worker.model_runner._paged_attention_backend = backend
-        self._worker.model_runner._paged_block_size = plan.block_size
+        self._worker.model_runner.install_paged_attention_backend(
+            backend,
+            block_size=plan.block_size,
+        )
 
     def get_model_memory_usage(self) -> int:
         """Return current model memory usage in bytes."""
@@ -723,8 +658,8 @@ class WorkerCachePlanner:
 
         if mode == "paged_attention_capacity":
             overhead = self._worker.model_runner.profile_run()
-            self._worker._setup_paged_attention(overhead=overhead)
-            backend = self._worker.model_runner._paged_attention_backend
+            self.setup_paged_attention(overhead=overhead)
+            backend = self._worker.model_runner.paged_attention_backend
             if backend is None:
                 raise RuntimeError(
                     "Paged attention backend not initialized for capacity reporting"
@@ -749,6 +684,16 @@ class WorkerCachePlanner:
         )
         return available
 
+    @staticmethod
+    def base_kv_budget_bytes(
+        metal_limit: int,
+        model_memory: int,
+        fraction: float,
+        overhead: int,
+    ) -> int:
+        """Return Metal-memory budget before hybrid GDN reservation."""
+        return int(metal_limit * fraction) - model_memory - overhead
+
     def _paged_attention_plan(self, *, overhead: int) -> _PagedAttentionPlan:
         block_size = self._worker.vllm_config.cache_config.block_size
         fraction = self._memory_fraction()
@@ -756,55 +701,54 @@ class WorkerCachePlanner:
         model_memory = self.get_model_memory_usage()
         per_block_bytes = self._worker.get_cache_block_size_bytes()
         usable_metal = int(metal_limit * fraction)
-        kv_budget_before_hybrid = self.kv_budget_bytes(
+        base_kv_budget = self.base_kv_budget_bytes(
             metal_limit,
             model_memory,
             fraction,
             overhead,
         )
         reservation = self._hybrid_gdn_reservation()
-        kv_budget = kv_budget_before_hybrid - reservation.total_bytes
-
-        breakdown = self._memory_breakdown(
-            metal_limit=metal_limit,
-            fraction=fraction,
-            usable_metal=usable_metal,
-            model_memory=model_memory,
-            overhead=overhead,
-            kv_budget_before_hybrid=kv_budget_before_hybrid,
-            reservation=reservation,
-            kv_budget=kv_budget,
-        )
-        mitigations = self._paged_attention_mitigations(
-            reservation,
-            kv_budget_before_hybrid=kv_budget_before_hybrid,
-        )
-
-        if kv_budget <= 0:
-            raise ValueError(
-                "Paged attention: not enough Metal memory for KV cache. "
-                f"{breakdown}. {mitigations}"
-            )
-
-        num_blocks = kv_budget // per_block_bytes
-        if num_blocks < PAGED_ATTENTION_MIN_BLOCKS:
-            raise ValueError(
-                "Paged attention: computed num_blocks too low "
-                f"({num_blocks} < minimum {PAGED_ATTENTION_MIN_BLOCKS}). "
-                f"{breakdown}, per_block_bytes={per_block_bytes}. {mitigations}"
-            )
-
-        return _PagedAttentionPlan(
+        kv_budget = base_kv_budget - reservation.total_bytes
+        plan = _PagedAttentionPlan(
             block_size=block_size,
             fraction=fraction,
             metal_limit=metal_limit,
             usable_metal=usable_metal,
             model_memory=model_memory,
+            overhead=overhead,
             per_block_bytes=per_block_bytes,
-            kv_budget_before_hybrid=kv_budget_before_hybrid,
+            base_kv_budget=base_kv_budget,
             hybrid_gdn_reservation=reservation,
             kv_budget=kv_budget,
-            num_blocks=num_blocks,
+            num_blocks=max(0, kv_budget // per_block_bytes),
+        )
+        self._validate_paged_attention_plan(plan)
+        return plan
+
+    def _validate_paged_attention_plan(self, plan: _PagedAttentionPlan) -> None:
+        if plan.kv_budget <= 0:
+            raise ValueError(
+                "Paged attention: not enough Metal memory for KV cache. "
+                f"{plan.format_breakdown()}. {plan.format_mitigations()}"
+            )
+
+        if plan.num_blocks < PAGED_ATTENTION_MIN_BLOCKS:
+            raise ValueError(
+                "Paged attention: computed num_blocks too low "
+                f"({plan.num_blocks} < minimum {PAGED_ATTENTION_MIN_BLOCKS}). "
+                f"{plan.format_breakdown()}, "
+                f"per_block_bytes={plan.per_block_bytes}. "
+                f"{plan.format_mitigations()}"
+            )
+
+    def _hybrid_gdn_reservation(self) -> _HybridGDNReservation:
+        """Return startup GDN state reserved outside the paged KV pool."""
+        runner = self._worker.model_runner
+        if not runner.is_hybrid:
+            return _HybridGDNReservation()
+        return _HybridGDNReservation(
+            bytes_per_slot=runner.linear_cache_bytes_per_slot(),
+            max_num_seqs=runner.scheduler_config.max_num_seqs,
         )
 
     def _memory_fraction(self) -> float:

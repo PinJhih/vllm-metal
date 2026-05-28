@@ -34,17 +34,6 @@ def _make_worker(model_runner: object, *, use_paged_attention: bool) -> MetalWor
 class TestWorkerRunnerBoundaryDelegation:
     """Worker should delegate STT capability decisions to model runner."""
 
-    def test_load_model_does_not_setup_paged_attention(self) -> None:
-        """Paged attention setup moved to determine_available_memory (issue #234)."""
-        model_runner = MagicMock()
-        worker = _make_worker(model_runner, use_paged_attention=True)
-        worker._setup_paged_attention = MagicMock()
-
-        MetalWorker.load_model(worker)
-
-        model_runner.load_model.assert_called_once_with()
-        worker._setup_paged_attention.assert_not_called()
-
     def test_reset_mm_cache_delegates_to_runner(self) -> None:
         model_runner = MagicMock()
         worker = _make_worker(model_runner, use_paged_attention=True)
@@ -86,7 +75,9 @@ class TestWorkerRunnerBoundaryDelegation:
             paged_attention_enabled=True
         )
 
-    def test_determine_available_memory_paged_capacity_mode(self) -> None:
+    def test_determine_available_memory_paged_capacity_mode(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         num_blocks = 8
         block_size_bytes = 16
         measured_overhead = 200 * 1024 * 1024
@@ -95,25 +86,28 @@ class TestWorkerRunnerBoundaryDelegation:
                 return_value="paged_attention_capacity"
             ),
             profile_run=MagicMock(return_value=measured_overhead),
-            _paged_attention_backend=None,
+            paged_attention_backend=None,
         )
         worker = _make_worker(model_runner, use_paged_attention=True)
         worker.get_cache_block_size_bytes = MagicMock(return_value=block_size_bytes)
 
         def _fake_setup(*, overhead: int) -> None:
-            model_runner._paged_attention_backend = SimpleNamespace(
+            model_runner.paged_attention_backend = SimpleNamespace(
                 num_blocks=lambda: num_blocks
             )
 
-        worker._setup_paged_attention = MagicMock(side_effect=_fake_setup)
+        setup_paged_attention = MagicMock(side_effect=_fake_setup)
+        monkeypatch.setattr(
+            WorkerCachePlanner,
+            "setup_paged_attention",
+            setup_paged_attention,
+        )
 
         available = MetalWorker.determine_available_memory(worker)
 
         assert available == num_blocks * block_size_bytes
         model_runner.profile_run.assert_called_once_with()
-        worker._setup_paged_attention.assert_called_once_with(
-            overhead=measured_overhead
-        )
+        setup_paged_attention.assert_called_once_with(overhead=measured_overhead)
         worker.get_cache_block_size_bytes.assert_called_once_with()
 
     def test_determine_available_memory_single_sequence_mode(self) -> None:
