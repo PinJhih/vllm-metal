@@ -94,7 +94,7 @@ def _runner_with_encoder_cache():
 def _paged_runner_with_encoder_cache():
     runner = make_stub_runner(
         encoder_cache=EncoderCache(),
-        _paged_attention_backend=MagicMock(),
+        _paged_attention_runtime=MagicMock(),
         _paged_block_size=16,
     )
     runner._start_paged_forward = MagicMock()
@@ -352,7 +352,7 @@ def test_reject_scheduled_encoder_inputs_raises_on_non_paged_backend() -> None:
     running the encoder and falling through to _prefill_single would silently
     drop image conditioning (or feed raw placeholder IDs to the LM).
     """
-    runner = _runner_with_encoder_cache()  # _paged_attention_backend is None
+    runner = _runner_with_encoder_cache()  # _paged_attention_runtime is None
     adapter = _RecordingAdapter()  # forward_ready = True
     runner._multimodal_adapter = adapter
     assert runner.encoder_cache is not None
